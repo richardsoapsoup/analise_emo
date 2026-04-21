@@ -1,4 +1,3 @@
-
 import threading
 import time
 from fer import FER
@@ -6,6 +5,8 @@ from datetime import datetime
 import uuid
 import math
 import requests
+import cv2
+import os
 
 
 MIN_FACE_SIZE = 80
@@ -14,16 +15,13 @@ TEMPO_MAX_INATIVO = 3
 COOLDOWN_RAIVA_EXTREMA = 10
 
 class EmotionDetector:
-    def __init__(self, get_frame, api_url="http://127.0.0.1:8000/evento", mtcnn=True, poll_interval=1.0):
-        """
-        get_frame: função que retorna o último frame (np.array) ou None
-        api_url: endpoint para enviar eventos (POST)
-        poll_interval: tempo entre iterações (segundos)
-        """
+    def __init__(self, get_frame, api_url="http://127.0.0.1:8000/evento", mtcnn=True, poll_interval=0.5, update_detections_cb=None):
+        
         self.get_frame = get_frame
         self.api_url = api_url
         self.mtcnn = mtcnn
         self.poll_interval = poll_interval
+        self.update_detections_cb = update_detections_cb 
 
         self._thread = None
         self._stop_event = threading.Event()
@@ -58,7 +56,7 @@ class EmotionDetector:
     def is_running(self):
         return self._running
 
-    # util helpers
+    
     def distancia(self, p1, p2):
         return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
@@ -105,6 +103,12 @@ class EmotionDetector:
 
             try:
                 results = self.detector.detect_emotions(frame)
+                
+                
+                if self.update_detections_cb:
+                    self.update_detections_cb(results)
+               
+
             except Exception as e:
                 print("[DETECTOR] Erro ao detectar emoções:", e)
                 time.sleep(self.poll_interval)
@@ -154,7 +158,9 @@ class EmotionDetector:
                         
                         filename = f"imagens_alerta/alerta_raiva_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
                         try:
-                            import cv2
+                            
+                            if not os.path.exists("imagens_alerta"):
+                                os.makedirs("imagens_alerta")
                             cv2.imwrite(filename, frame)
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] [SALVO] Frame de raiva extrema salvo como {filename}")
                         except Exception:

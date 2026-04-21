@@ -1,4 +1,4 @@
-# main.py
+
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -6,17 +6,17 @@ from datetime import datetime
 import threading
 import time
 import cv2
-import os
-import signal
-import sys
+
+import numpy as np
 
 
 from deteccao import EmotionDetector  
-import requests
+
+
 
 
 from backend.models import EventoEmocao
-from backend.database import colecao_eventos
+from backend.database import colecao_eventos 
 
 app = FastAPI(title="API de Monitoramento Emocional")
 
@@ -43,9 +43,10 @@ latest_frame = None
 frame_lock = threading.Lock()
 capture_thread = None
 capture_thread_stop = threading.Event()
+last_detections = [] 
 
 def capture_loop():
-    """Thread que lê da câmera e atualiza latest_frame."""
+    
     global latest_frame
     while not capture_thread_stop.is_set():
         success, frame = cap.read()
@@ -83,6 +84,13 @@ detector_lock = threading.Lock()
 
 API_EVENT_URL = "http://127.0.0.1:8000/evento"
 
+
+def set_last_detections(detections):
+   
+    global last_detections
+    last_detections = detections
+
+
 @app.post("/start_detector")
 def start_detector():
     global detector
@@ -95,7 +103,13 @@ def start_detector():
                 if latest_frame is None:
                     return None
                 return latest_frame.copy()
-        detector = EmotionDetector(get_frame=get_frame, api_url=API_EVENT_URL)
+        
+        
+        detector = EmotionDetector(
+            get_frame=get_frame, 
+            api_url=API_EVENT_URL, 
+            update_detections_cb=set_last_detections
+        )
         detector.start()
         return {"status": "ok", "mensagem": "Detector iniciado."}
 
@@ -123,12 +137,10 @@ def listar_eventos(limit: int = 10):
     return eventos
 
 
-import numpy as np
-
 def mjpeg_generator():
-    """
-    Gera frames JPEG a partir do latest_frame (compartilhado).
-    """
+    
+
+    global last_detections
     while True:
         with frame_lock:
             frame = None if latest_frame is None else latest_frame.copy()
@@ -141,6 +153,25 @@ def mjpeg_generator():
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             time.sleep(0.1)
             continue
+
+       
+        if last_detections:
+            for det in last_detections:
+                (x, y, w, h) = det["box"]
+                emotion = max(det["emotions"], key=det["emotions"].get)
+                color = (0, 255, 0)
+                if emotion == "angry":
+                    color = (0, 0, 255)
+                elif emotion == "sad":
+                    color = (255, 0, 0)
+                elif emotion == "happy":
+                    color = (0, 255, 0)
+                else:
+                    color = (255, 255, 0)
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(frame, emotion, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
         
         cv2.putText(frame, datetime.now().strftime("%H:%M:%S"),
@@ -156,9 +187,6 @@ def mjpeg_generator():
 @app.get("/video_feed")
 def video_feed():
     global detector
-    """
-    Retorna MJPEG stream. Inicia detector automaticamente se não estiver rodando.
-    """
     
     with detector_lock:
         if not (detector and detector.is_running()):
@@ -171,7 +199,12 @@ def video_feed():
                             return None
                         return latest_frame.copy()
                 
-                detector = EmotionDetector(get_frame=get_frame, api_url=API_EVENT_URL)
+                
+                detector = EmotionDetector(
+                    get_frame=get_frame, 
+                    api_url=API_EVENT_URL,
+                    update_detections_cb=set_last_detections
+                )
                 detector.start()
                 print("[VIDEO_FEED] Detector iniciado automaticamente.")
             except Exception as e:

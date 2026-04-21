@@ -1,6 +1,6 @@
 # Análise de Emoções e Comportamento com OpenCV + FER + Elasticsearch
 
-Este projeto detecta expressões faciais em tempo real via webcam, classifica o comportamento emocional e envia os dados para o Elasticsearch. Ideal para aplicações em monitoramento, segurança, UX e pesquisa comportamental.
+Este projeto detecta expressões faciais em tempo real via webcam, classifica o comportamento emocional e envia os dados para o Banco de dados mongodb. Ideal para aplicações em monitoramento, segurança, UX e pesquisa comportamental.
 
 ---
 
@@ -9,7 +9,7 @@ Este projeto detecta expressões faciais em tempo real via webcam, classifica o 
 - Captura de vídeo em tempo real com OpenCV
 - Detecção de emoções com a biblioteca [FER](https://github.com/justinshenk/fer)
 - Classificação de comportamento (ex: positivo, agressivo, depressivo)
-- Envio de dados para o Elasticsearch em tempo real
+- Envio de dados para banco de dados com mongodb
 - Visualização com anotação de emoção na tela
 
 ---
@@ -17,7 +17,7 @@ Este projeto detecta expressões faciais em tempo real via webcam, classifica o 
 ## Requisitos
 
 - Python 3.7 ou superior
-- Elasticsearch rodando localmente (ou remotamente)
+- Mongodb instalado
 - Webcam conectada e funcional
 
 ---
@@ -46,7 +46,7 @@ pip install -r requirements.txt
 
 ### 4. Execute o programa
 ```bash
-python main.py
+uvicorn backend.main:app --reload    
 
 ```
 
