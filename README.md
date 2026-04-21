@@ -26,7 +26,7 @@ Este projeto detecta expressões faciais em tempo real via webcam, classifica o 
 
 ### 1. Clone o repositório
 ```bash
-git clone https://github.com/richardsoapsoup/analise_emocao
+git clone https://github.com/richardsoapsoup/analise_emo
 cd analise_emocao
 
 
