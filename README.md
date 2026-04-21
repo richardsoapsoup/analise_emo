@@ -1,4 +1,4 @@
-# Análise de Emoções e Comportamento com OpenCV + FER + Elasticsearch
+# Análise de Emoções e Comportamento com OpenCV + FER + MongoDB
 
 Este projeto detecta expressões faciais em tempo real via webcam, classifica o comportamento emocional e envia os dados para o Banco de dados mongodb. Ideal para aplicações em monitoramento, segurança, UX e pesquisa comportamental.
 
