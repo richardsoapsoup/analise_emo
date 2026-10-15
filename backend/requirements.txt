@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pymongo
+python-dotenv
+opencv-python
+fer
+requests
+numpy
+pydantic

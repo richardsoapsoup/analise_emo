@@ -2,6 +2,14 @@ import threading, time, uuid, math, requests, cv2, os
 from datetime import datetime
 from fer import FER
 
+try:
+    from backend.alerts_service import registrar_alerta_raiva
+except ImportError:
+    try:
+        from alerts_service import registrar_alerta_raiva
+    except ImportError:
+        registrar_alerta_raiva = None
+
 MIN_FACE_SIZE = 80
 DISTANCIA_MAX = 80
 TEMPO_MAX_INATIVO = 3
@@ -80,14 +88,20 @@ class EmotionDetector:
             if not existe:
                 self.rostos_detectados.append((centro_atual, agora))
 
-    def salvar_frame_raiva_extrema(self, frame):
+    def salvar_frame_raiva_extrema(self, frame, score=0.9):
         agora = time.time()
         if agora - self.ultimo_registro_raiva_extrema < COOLDOWN_RAIVA_EXTREMA:
             return
-        os.makedirs('imagens_alerta', exist_ok=True)
-        filename = f"imagens_alerta/alerta_raiva_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
-        cv2.imwrite(filename, frame)
         self.ultimo_registro_raiva_extrema = agora
+        if registrar_alerta_raiva:
+            try:
+                registrar_alerta_raiva(self.camera_id, self.camera_nome, score, frame)
+            except Exception as e:
+                print(f"[ALERTA] Erro ao registrar alerta: {e}")
+        else:
+            os.makedirs('imagens_alerta', exist_ok=True)
+            filename = f"imagens_alerta/alerta_raiva_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(filename, frame)
 
     def enviar_evento_backend(self, doc):
         try:
@@ -101,8 +115,8 @@ class EmotionDetector:
         emotions = result['emotions']
         top = max(emotions, key=emotions.get)
         score = emotions[top]
-        if top == 'angry' and score > 0.9:
-            self.salvar_frame_raiva_extrema(frame)
+        if top == 'angry' and score > 0.8:
+            self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
             'timestamp': datetime.utcnow().isoformat(),
@@ -132,8 +146,8 @@ class EmotionDetector:
         medias = {emo: val / faces for emo, val in soma.items()}
         top = max(medias, key=medias.get)
         score = medias[top]
-        if top == 'angry' and score > 0.9:
-            self.salvar_frame_raiva_extrema(frame)
+        if top == 'angry' and score > 0.8:
+            self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
             'timestamp': datetime.utcnow().isoformat(),
