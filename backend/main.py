@@ -4,20 +4,35 @@ from bson import ObjectId
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-try:
-    from backend.models import EventoEmocao, UsuarioCreate, UsuarioUpdate, CameraCreate, CameraUpdate
-    from backend.database import colecao_eventos, colecao_usuarios, colecao_cameras
-except ImportError:
-    from models import EventoEmocao, UsuarioCreate, UsuarioUpdate, CameraCreate, CameraUpdate
-    from database import colecao_eventos, colecao_usuarios, colecao_cameras
+import os
+from fastapi.staticfiles import StaticFiles
 
 try:
-    from deteccao import EmotionDetector
+    from backend.models import EventoEmocao, UsuarioCreate, UsuarioUpdate, CameraCreate, CameraUpdate
+    from backend.database import colecao_eventos, colecao_usuarios, colecao_cameras, colecao_alertas, colecao_config_alertas
+    from backend.alerts_service import (
+        obter_config_alertas, atualizar_config_alertas,
+        enviar_email_alerta, registrar_alerta_raiva, ALERTA_IMG_DIR
+    )
 except ImportError:
+    from models import EventoEmocao, UsuarioCreate, UsuarioUpdate, CameraCreate, CameraUpdate
+    from database import colecao_eventos, colecao_usuarios, colecao_cameras, colecao_alertas, colecao_config_alertas
+    from alerts_service import (
+        obter_config_alertas, atualizar_config_alertas,
+        enviar_email_alerta, registrar_alerta_raiva, ALERTA_IMG_DIR
+    )
+
+try:
     from backend.deteccao import EmotionDetector
+except ImportError:
+    from deteccao import EmotionDetector
 
 app = FastAPI(title='API de Monitoramento Emocional')
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173','http://127.0.0.1:5173'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+
+os.makedirs(ALERTA_IMG_DIR, exist_ok=True)
+app.mount('/imagens_alerta', StaticFiles(directory=ALERTA_IMG_DIR), name='imagens_alerta')
+
 API_EVENT_URL = 'http://127.0.0.1:8000/evento'
 
 def oid(id):
@@ -29,7 +44,11 @@ def serializar(doc):
     return doc
 
 def normalizar_origem(origem):
-    return int(origem) if isinstance(origem, str) and origem.isdigit() else origem
+    if isinstance(origem, int):
+        return origem
+    if isinstance(origem, str) and origem.strip().isdigit():
+        return int(origem.strip())
+    return origem
 
 class CameraRuntime:
     def __init__(self, doc):
@@ -50,26 +69,41 @@ class CameraRuntime:
         self.release_timer = None
 
     def abrir(self):
-        if self.cap and self.cap.isOpened(): return
-        self.cap = cv2.VideoCapture(normalizar_origem(self.origem))
+        if self.cap and self.cap.isOpened():
+            return
+        src = normalizar_origem(self.origem)
+        if isinstance(src, int):
+            self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+            if not self.cap or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(src)
+        else:
+            self.cap = cv2.VideoCapture(src)
+        if self.cap and self.cap.isOpened():
+            print(f"[CAMERA] Hardware aberto com sucesso: '{self.nome}' (origem: {self.origem})")
+        else:
+            print(f"[CAMERA] AVISO: Não foi possível abrir dispositivo: '{self.nome}' (origem: {self.origem})")
 
     def iniciar_captura(self):
-        if self.capture_thread and self.capture_thread.is_alive(): return
-        self.abrir()
         self.stop_capture.clear()
+        if self.capture_thread and self.capture_thread.is_alive():
+            if not self.cap or not self.cap.isOpened():
+                self.abrir()
+            return
+        self.abrir()
         self.capture_thread = threading.Thread(target=self.loop_captura, daemon=True)
         self.capture_thread.start()
 
     def loop_captura(self):
         while not self.stop_capture.is_set():
             if not self.cap or not self.cap.isOpened():
-                time.sleep(0.5)
+                time.sleep(0.3)
                 if not self.stop_capture.is_set():
                     self.abrir()
                 continue
             ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.1); continue
+            if not ok or frame is None:
+                time.sleep(0.05)
+                continue
             with self.frame_lock:
                 self.latest_frame = frame.copy()
             time.sleep(0.01)
@@ -90,30 +124,39 @@ class CameraRuntime:
 
     def parar_detector(self):
         with self.detector_lock:
-            if self.detector and self.detector.is_running(): self.detector.stop()
-            self.detector = None
+            if self.detector:
+                try:
+                    self.detector.stop()
+                except Exception as e:
+                    print(f"[DETECTOR] Erro ao parar detector: {e}")
+                self.detector = None
 
     def alterar_modo(self, modo):
         self.modo_monitoramento = modo
         if self.detector: self.detector.set_modo_monitoramento(modo)
 
     def fechar(self):
+        print(f"[CAMERA] Encerrando câmera '{self.nome}'...")
         with self.viewers_lock:
             if self.release_timer:
                 self.release_timer.cancel()
                 self.release_timer = None
-        self.parar_detector()
+            self.active_viewers = 0
         self.stop_capture.set()
+        self.parar_detector()
         if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=1.5)
+            self.capture_thread.join(timeout=1.0)
         self.capture_thread = None
         with self.frame_lock:
             if self.cap:
-                if self.cap.isOpened():
-                    self.cap.release()
+                try:
+                    if self.cap.isOpened():
+                        self.cap.release()
+                except Exception as e:
+                    print(f"[CAMERA] Erro ao liberar cap: {e}")
                 self.cap = None
             self.latest_frame = None
-        print(f"[CAMERA] Câmera '{self.nome}' encerrada e webcam liberada com sucesso.")
+        print(f"[CAMERA] Câmera '{self.nome}' encerrada e hardware liberado com sucesso.")
 
     def adicionar_visualizador(self):
         with self.viewers_lock:
@@ -220,12 +263,15 @@ def atualizar_camera(camera_id: str, camera: CameraUpdate):
 
 @app.delete('/cameras/{camera_id}')
 def remover_camera(camera_id: str):
-    r = colecao_cameras.delete_one({'_id': oid(camera_id)})
-    if not r.deleted_count: raise HTTPException(status_code=404, detail='Câmera não encontrada')
     with runtimes_lock:
         rt = runtimes.pop(camera_id, None)
-        if rt: rt.fechar()
-    return {'status':'ok'}
+        if rt:
+            rt.fechar()
+    try:
+        colecao_cameras.delete_one({'_id': oid(camera_id)})
+    except Exception as e:
+        print(f"[CAMERAS] Aviso ao deletar no banco: {e}")
+    return {'status': 'ok'}
 
 @app.post('/cameras/{camera_id}/start')
 def iniciar(camera_id: str):
@@ -235,10 +281,10 @@ def iniciar(camera_id: str):
 
 @app.post('/cameras/{camera_id}/stop')
 def parar(camera_id: str):
-    rt = runtime_camera(camera_id)
-    rt.parar_detector()
-    with rt.viewers_lock:
-        if rt.active_viewers == 0:
+    with runtimes_lock:
+        rt = runtimes.get(camera_id)
+        if rt:
+            rt.parar_detector()
             rt.fechar()
     return {'status': 'ok'}
 
@@ -261,12 +307,12 @@ def gerar_mjpeg(camera_id):
     rt = runtime_camera(camera_id)
     rt.adicionar_visualizador()
     try:
-        while True:
+        while not rt.stop_capture.is_set():
             frame = rt.renderizar()
-            ok, buffer = cv2.imencode('.jpg', frame)
+            ok, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
-            time.sleep(0.04)
+            time.sleep(0.033)
     except (GeneratorExit, Exception):
         pass
     finally:
@@ -314,6 +360,85 @@ def relatorio_usuarios():
         media = round(sum(float(e.get('pontuacao', 0)) for e in eventos) / total, 2) if total else 0
         resposta.append({'_id': uid, 'nome': u.get('nome'), 'email': u.get('email'), 'departamento': u.get('departamento'), 'total_eventos': total, 'alertas': alertas, 'positivos': positivos, 'pontuacao_media': media, 'ultimo_evento': eventos[0]['timestamp'] if eventos else None, 'status': 'warning' if alertas >= 3 else 'normal'})
     return resposta
+
+@app.get('/alertas')
+def listar_alertas(limit: int = 50, status: str | None = None):
+    filtro = {} if not status else {'status': status}
+    docs = list(colecao_alertas.find(filtro).sort('timestamp', -1).limit(limit))
+    return [serializar(d) for d in docs]
+
+@app.put('/alertas/{alerta_id}/status')
+def atualizar_status_alerta(alerta_id: str, status: str):
+    if status not in ['novo', 'reconhecido', 'resolvido']:
+        raise HTTPException(status_code=400, detail='Status inválido')
+    r = colecao_alertas.update_one({'_id': oid(alerta_id)}, {'$set': {'status': status, 'updated_at': datetime.utcnow()}})
+    if not r.matched_count:
+        raise HTTPException(status_code=404, detail='Alerta não encontrado')
+    return serializar(colecao_alertas.find_one({'_id': oid(alerta_id)}))
+
+@app.delete('/alertas/{alerta_id}')
+def remover_alerta(alerta_id: str):
+    doc = colecao_alertas.find_one({'_id': oid(alerta_id)})
+    if doc and doc.get('imagem_url'):
+        fname = os.path.basename(doc['imagem_url'])
+        fpath = os.path.join(ALERTA_IMG_DIR, fname)
+        if os.path.exists(fpath):
+            try: os.remove(fpath)
+            except Exception: pass
+    colecao_alertas.delete_one({'_id': oid(alerta_id)})
+    return {'status': 'ok'}
+
+@app.get('/alertas/config')
+def get_alerta_config():
+    return obter_config_alertas()
+
+@app.put('/alertas/config')
+def put_alerta_config(dados: dict):
+    return atualizar_config_alertas(dados)
+
+@app.post('/alertas/testar')
+def testar_alerta_manual():
+    frame = None
+    with runtimes_lock:
+        for rt in runtimes.values():
+            f = rt.get_frame()
+            if f is not None:
+                frame = f.copy()
+                break
+    if frame is None:
+        frame = 240 * np.ones((480, 640, 3), dtype=np.uint8)
+        cv2.rectangle(frame, (20, 20), (620, 460), (0, 0, 220), 4)
+        cv2.putText(frame, "SIMULACAO: RAIVA EXTREMA DETECTADA", (40, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
+        cv2.putText(frame, f"Nivel: 96% | {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S UTC')}", (40, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 50, 50), 2)
+
+    config = obter_config_alertas()
+    filename = f"alerta_raiva_teste_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
+    filepath = os.path.join(ALERTA_IMG_DIR, filename)
+    cv2.imwrite(filepath, frame)
+
+    doc = {
+        'camera_id': 'teste_manual',
+        'camera_nome': 'Disparo Manual de Teste',
+        'tipo': 'raiva_extrema',
+        'score': 0.96,
+        'pontuacao_percentual': 96.0,
+        'timestamp': datetime.utcnow(),
+        'imagem_url': f"/imagens_alerta/{filename}",
+        'status': 'novo',
+        'email_enviado': False,
+        'email_destinatario': config.get('email_destino', '')
+    }
+    res = colecao_alertas.insert_one(doc)
+    doc['_id'] = str(res.inserted_id)
+    doc['timestamp'] = doc['timestamp'].isoformat()
+
+    retorno_email = None
+    if config.get('email_destino'):
+        retorno_email = enviar_email_alerta(doc, config, filepath)
+        sucesso = retorno_email.get('status') in ['sucesso', 'simulado']
+        colecao_alertas.update_one({'_id': res.inserted_id}, {'$set': {'email_enviado': sucesso, 'email_retorno': retorno_email.get('mensagem')}})
+
+    return {'status': 'ok', 'alerta': doc, 'email_resultado': retorno_email}
 
 @app.on_event('shutdown')
 def shutdown():
