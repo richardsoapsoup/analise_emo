@@ -37,12 +37,11 @@ class EmotionDetector:
         print(f'[DETECTOR] Iniciado: {self.camera_nome}')
 
     def stop(self):
-        if not self._running:
-            return
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=3)
         self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self._thread = None
         print(f'[DETECTOR] Parado: {self.camera_nome}')
 
     def is_running(self):
@@ -153,24 +152,29 @@ class EmotionDetector:
     def _run(self):
         while not self._stop_event.is_set():
             frame = self.get_frame()
-            if frame is None:
-                time.sleep(0.2)
+            if frame is None or self._stop_event.is_set():
+                time.sleep(0.1)
                 continue
             try:
                 results = self.detector.detect_emotions(frame)
-                if self.update_detections_cb:
+                if self.update_detections_cb and not self._stop_event.is_set():
                     self.update_detections_cb(results)
             except Exception as e:
-                print('[DETECTOR] Erro:', e)
+                if not self._stop_event.is_set():
+                    print('[DETECTOR] Erro:', e)
                 time.sleep(self.poll_interval)
                 continue
+            if self._stop_event.is_set():
+                break
             self.atualizar_rostos(results)
             if self.modo_monitoramento == 'sala':
                 evento = self.evento_sala(results, frame)
-                if evento:
+                if evento and not self._stop_event.is_set():
                     self.enviar_evento_backend(evento)
             else:
                 for result in results:
+                    if self._stop_event.is_set():
+                        break
                     x, y, w, h = result['box']
                     if w >= MIN_FACE_SIZE and h >= MIN_FACE_SIZE:
                         self.enviar_evento_backend(self.evento_individual(result, frame))

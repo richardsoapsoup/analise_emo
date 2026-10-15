@@ -29,7 +29,11 @@ def serializar(doc):
     return doc
 
 def normalizar_origem(origem):
-    return int(origem) if isinstance(origem, str) and origem.isdigit() else origem
+    if isinstance(origem, int):
+        return origem
+    if isinstance(origem, str) and origem.strip().isdigit():
+        return int(origem.strip())
+    return origem
 
 class CameraRuntime:
     def __init__(self, doc):
@@ -50,26 +54,41 @@ class CameraRuntime:
         self.release_timer = None
 
     def abrir(self):
-        if self.cap and self.cap.isOpened(): return
-        self.cap = cv2.VideoCapture(normalizar_origem(self.origem))
+        if self.cap and self.cap.isOpened():
+            return
+        src = normalizar_origem(self.origem)
+        if isinstance(src, int):
+            self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+            if not self.cap or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(src)
+        else:
+            self.cap = cv2.VideoCapture(src)
+        if self.cap and self.cap.isOpened():
+            print(f"[CAMERA] Hardware aberto com sucesso: '{self.nome}' (origem: {self.origem})")
+        else:
+            print(f"[CAMERA] AVISO: Não foi possível abrir dispositivo: '{self.nome}' (origem: {self.origem})")
 
     def iniciar_captura(self):
-        if self.capture_thread and self.capture_thread.is_alive(): return
-        self.abrir()
         self.stop_capture.clear()
+        if self.capture_thread and self.capture_thread.is_alive():
+            if not self.cap or not self.cap.isOpened():
+                self.abrir()
+            return
+        self.abrir()
         self.capture_thread = threading.Thread(target=self.loop_captura, daemon=True)
         self.capture_thread.start()
 
     def loop_captura(self):
         while not self.stop_capture.is_set():
             if not self.cap or not self.cap.isOpened():
-                time.sleep(0.5)
+                time.sleep(0.3)
                 if not self.stop_capture.is_set():
                     self.abrir()
                 continue
             ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.1); continue
+            if not ok or frame is None:
+                time.sleep(0.05)
+                continue
             with self.frame_lock:
                 self.latest_frame = frame.copy()
             time.sleep(0.01)
@@ -90,30 +109,39 @@ class CameraRuntime:
 
     def parar_detector(self):
         with self.detector_lock:
-            if self.detector and self.detector.is_running(): self.detector.stop()
-            self.detector = None
+            if self.detector:
+                try:
+                    self.detector.stop()
+                except Exception as e:
+                    print(f"[DETECTOR] Erro ao parar detector: {e}")
+                self.detector = None
 
     def alterar_modo(self, modo):
         self.modo_monitoramento = modo
         if self.detector: self.detector.set_modo_monitoramento(modo)
 
     def fechar(self):
+        print(f"[CAMERA] Encerrando câmera '{self.nome}'...")
         with self.viewers_lock:
             if self.release_timer:
                 self.release_timer.cancel()
                 self.release_timer = None
-        self.parar_detector()
+            self.active_viewers = 0
         self.stop_capture.set()
+        self.parar_detector()
         if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=1.5)
+            self.capture_thread.join(timeout=1.0)
         self.capture_thread = None
         with self.frame_lock:
             if self.cap:
-                if self.cap.isOpened():
-                    self.cap.release()
+                try:
+                    if self.cap.isOpened():
+                        self.cap.release()
+                except Exception as e:
+                    print(f"[CAMERA] Erro ao liberar cap: {e}")
                 self.cap = None
             self.latest_frame = None
-        print(f"[CAMERA] Câmera '{self.nome}' encerrada e webcam liberada com sucesso.")
+        print(f"[CAMERA] Câmera '{self.nome}' encerrada e hardware liberado com sucesso.")
 
     def adicionar_visualizador(self):
         with self.viewers_lock:
@@ -220,12 +248,15 @@ def atualizar_camera(camera_id: str, camera: CameraUpdate):
 
 @app.delete('/cameras/{camera_id}')
 def remover_camera(camera_id: str):
-    r = colecao_cameras.delete_one({'_id': oid(camera_id)})
-    if not r.deleted_count: raise HTTPException(status_code=404, detail='Câmera não encontrada')
     with runtimes_lock:
         rt = runtimes.pop(camera_id, None)
-        if rt: rt.fechar()
-    return {'status':'ok'}
+        if rt:
+            rt.fechar()
+    try:
+        colecao_cameras.delete_one({'_id': oid(camera_id)})
+    except Exception as e:
+        print(f"[CAMERAS] Aviso ao deletar no banco: {e}")
+    return {'status': 'ok'}
 
 @app.post('/cameras/{camera_id}/start')
 def iniciar(camera_id: str):
@@ -235,10 +266,10 @@ def iniciar(camera_id: str):
 
 @app.post('/cameras/{camera_id}/stop')
 def parar(camera_id: str):
-    rt = runtime_camera(camera_id)
-    rt.parar_detector()
-    with rt.viewers_lock:
-        if rt.active_viewers == 0:
+    with runtimes_lock:
+        rt = runtimes.get(camera_id)
+        if rt:
+            rt.parar_detector()
             rt.fechar()
     return {'status': 'ok'}
 
@@ -261,12 +292,12 @@ def gerar_mjpeg(camera_id):
     rt = runtime_camera(camera_id)
     rt.adicionar_visualizador()
     try:
-        while True:
+        while not rt.stop_capture.is_set():
             frame = rt.renderizar()
-            ok, buffer = cv2.imencode('.jpg', frame)
+            ok, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
-            time.sleep(0.04)
+            time.sleep(0.033)
     except (GeneratorExit, Exception):
         pass
     finally:
