@@ -2,6 +2,14 @@ import threading, time, uuid, math, requests, cv2, os
 from datetime import datetime
 from fer import FER
 
+try:
+    from backend.alerts_service import registrar_alerta_raiva
+except ImportError:
+    try:
+        from alerts_service import registrar_alerta_raiva
+    except ImportError:
+        registrar_alerta_raiva = None
+
 MIN_FACE_SIZE = 80
 DISTANCIA_MAX = 80
 TEMPO_MAX_INATIVO = 3
@@ -37,12 +45,11 @@ class EmotionDetector:
         print(f'[DETECTOR] Iniciado: {self.camera_nome}')
 
     def stop(self):
-        if not self._running:
-            return
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=3)
         self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self._thread = None
         print(f'[DETECTOR] Parado: {self.camera_nome}')
 
     def is_running(self):
@@ -81,14 +88,25 @@ class EmotionDetector:
             if not existe:
                 self.rostos_detectados.append((centro_atual, agora))
 
-    def salvar_frame_raiva_extrema(self, frame):
-        agora = time.time()
-        if agora - self.ultimo_registro_raiva_extrema < COOLDOWN_RAIVA_EXTREMA:
-            return
-        os.makedirs('imagens_alerta', exist_ok=True)
-        filename = f"imagens_alerta/alerta_raiva_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
-        cv2.imwrite(filename, frame)
-        self.ultimo_registro_raiva_extrema = agora
+    def salvar_frame_raiva_extrema(self, frame, score=0.9):
+        if registrar_alerta_raiva:
+            try:
+                res = registrar_alerta_raiva(self.camera_id, self.camera_nome, score, frame)
+                if res:
+                    print(f"[ALERTA SUCESSO] Raiva extrema registrada: {self.camera_nome} (Score: {score:.2f})")
+                else:
+                    print(f"[ALERTA COOLDOWN] Raiva detectada ({score:.2f}), mas em cooldown ou abaixo do limiar.")
+            except Exception as e:
+                print(f"[ALERTA ERRO] Erro ao registrar alerta: {e}")
+        else:
+            print("[ALERTA AVISO] registrar_alerta_raiva não está disponível.")
+            agora = time.time()
+            if agora - self.ultimo_registro_raiva_extrema < COOLDOWN_RAIVA_EXTREMA:
+                return
+            self.ultimo_registro_raiva_extrema = agora
+            os.makedirs('imagens_alerta', exist_ok=True)
+            filename = f"imagens_alerta/alerta_raiva_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(filename, frame)
 
     def enviar_evento_backend(self, doc):
         try:
@@ -102,8 +120,8 @@ class EmotionDetector:
         emotions = result['emotions']
         top = max(emotions, key=emotions.get)
         score = emotions[top]
-        if top == 'angry' and score > 0.9:
-            self.salvar_frame_raiva_extrema(frame)
+        if top == 'angry' and score >= 0.60:
+            self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
             'timestamp': datetime.utcnow().isoformat(),
@@ -133,8 +151,8 @@ class EmotionDetector:
         medias = {emo: val / faces for emo, val in soma.items()}
         top = max(medias, key=medias.get)
         score = medias[top]
-        if top == 'angry' and score > 0.9:
-            self.salvar_frame_raiva_extrema(frame)
+        if top == 'angry' and score >= 0.60:
+            self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
             'timestamp': datetime.utcnow().isoformat(),
@@ -153,24 +171,29 @@ class EmotionDetector:
     def _run(self):
         while not self._stop_event.is_set():
             frame = self.get_frame()
-            if frame is None:
-                time.sleep(0.2)
+            if frame is None or self._stop_event.is_set():
+                time.sleep(0.1)
                 continue
             try:
                 results = self.detector.detect_emotions(frame)
-                if self.update_detections_cb:
+                if self.update_detections_cb and not self._stop_event.is_set():
                     self.update_detections_cb(results)
             except Exception as e:
-                print('[DETECTOR] Erro:', e)
+                if not self._stop_event.is_set():
+                    print('[DETECTOR] Erro:', e)
                 time.sleep(self.poll_interval)
                 continue
+            if self._stop_event.is_set():
+                break
             self.atualizar_rostos(results)
             if self.modo_monitoramento == 'sala':
                 evento = self.evento_sala(results, frame)
-                if evento:
+                if evento and not self._stop_event.is_set():
                     self.enviar_evento_backend(evento)
             else:
                 for result in results:
+                    if self._stop_event.is_set():
+                        break
                     x, y, w, h = result['box']
                     if w >= MIN_FACE_SIZE and h >= MIN_FACE_SIZE:
                         self.enviar_evento_backend(self.evento_individual(result, frame))

@@ -91,10 +91,15 @@ class EmotionDetector:
     def salvar_frame_raiva_extrema(self, frame, score=0.9):
         if registrar_alerta_raiva:
             try:
-                registrar_alerta_raiva(self.camera_id, self.camera_nome, score, frame)
+                res = registrar_alerta_raiva(self.camera_id, self.camera_nome, score, frame)
+                if res:
+                    print(f"[ALERTA SUCESSO] Raiva extrema registrada: {self.camera_nome} (Score: {score:.2f})")
+                else:
+                    print(f"[ALERTA COOLDOWN] Raiva detectada ({score:.2f}), mas em cooldown ou abaixo do limiar.")
             except Exception as e:
-                print(f"[ALERTA] Erro ao registrar alerta: {e}")
+                print(f"[ALERTA ERRO] Erro ao registrar alerta: {e}")
         else:
+            print("[ALERTA AVISO] registrar_alerta_raiva não está disponível.")
             agora = time.time()
             if agora - self.ultimo_registro_raiva_extrema < COOLDOWN_RAIVA_EXTREMA:
                 return
