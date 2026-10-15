@@ -45,6 +45,9 @@ class CameraRuntime:
         self.detector = None
         self.detector_lock = threading.Lock()
         self.last_detections = []
+        self.active_viewers = 0
+        self.viewers_lock = threading.Lock()
+        self.release_timer = None
 
     def abrir(self):
         if self.cap and self.cap.isOpened(): return
@@ -60,10 +63,13 @@ class CameraRuntime:
     def loop_captura(self):
         while not self.stop_capture.is_set():
             if not self.cap or not self.cap.isOpened():
-                time.sleep(0.5); self.abrir(); continue
+                time.sleep(0.5)
+                if not self.stop_capture.is_set():
+                    self.abrir()
+                continue
             ok, frame = self.cap.read()
             if not ok:
-                time.sleep(0.2); continue
+                time.sleep(0.1); continue
             with self.frame_lock:
                 self.latest_frame = frame.copy()
             time.sleep(0.01)
@@ -77,8 +83,8 @@ class CameraRuntime:
 
     def iniciar_detector(self):
         with self.detector_lock:
-            if self.detector and self.detector.is_running(): return
             self.iniciar_captura()
+            if self.detector and self.detector.is_running(): return
             self.detector = EmotionDetector(self.get_frame, API_EVENT_URL, update_detections_cb=self.set_detections, camera_id=self.camera_id, camera_nome=self.nome, modo_monitoramento=self.modo_monitoramento)
             self.detector.start()
 
@@ -92,10 +98,51 @@ class CameraRuntime:
         if self.detector: self.detector.set_modo_monitoramento(modo)
 
     def fechar(self):
+        with self.viewers_lock:
+            if self.release_timer:
+                self.release_timer.cancel()
+                self.release_timer = None
         self.parar_detector()
         self.stop_capture.set()
-        if self.capture_thread: self.capture_thread.join(timeout=2)
-        if self.cap and self.cap.isOpened(): self.cap.release()
+        if self.capture_thread and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=1.5)
+        self.capture_thread = None
+        with self.frame_lock:
+            if self.cap:
+                if self.cap.isOpened():
+                    self.cap.release()
+                self.cap = None
+            self.latest_frame = None
+        print(f"[CAMERA] Câmera '{self.nome}' encerrada e webcam liberada com sucesso.")
+
+    def adicionar_visualizador(self):
+        with self.viewers_lock:
+            if self.release_timer:
+                self.release_timer.cancel()
+                self.release_timer = None
+            self.active_viewers += 1
+            print(f"[CAMERA] Visualizador conectado ({self.nome}). Total de visualizadores ativos: {self.active_viewers}")
+            self.iniciar_detector()
+
+    def remover_visualizador(self):
+        with self.viewers_lock:
+            self.active_viewers = max(0, self.active_viewers - 1)
+            print(f"[CAMERA] Visualizador desconectado ({self.nome}). Restantes: {self.active_viewers}")
+            if self.active_viewers == 0:
+                self._agendar_fechamento()
+
+    def _agendar_fechamento(self):
+        if self.release_timer:
+            self.release_timer.cancel()
+        self.release_timer = threading.Timer(2.0, self._desligar_se_sem_visualizadores)
+        self.release_timer.daemon = True
+        self.release_timer.start()
+
+    def _desligar_se_sem_visualizadores(self):
+        with self.viewers_lock:
+            if self.active_viewers == 0:
+                print(f"[CAMERA] Nenhum visualizador ativo há 2 segundos. Desligando hardware da câmera '{self.nome}'...")
+                self.fechar()
 
     def renderizar(self):
         frame = self.get_frame()
@@ -181,10 +228,27 @@ def remover_camera(camera_id: str):
     return {'status':'ok'}
 
 @app.post('/cameras/{camera_id}/start')
-def iniciar(camera_id: str): runtime_camera(camera_id).iniciar_detector(); return {'status':'ok'}
+def iniciar(camera_id: str):
+    rt = runtime_camera(camera_id)
+    rt.iniciar_detector()
+    return {'status': 'ok'}
 
 @app.post('/cameras/{camera_id}/stop')
-def parar(camera_id: str): runtime_camera(camera_id).parar_detector(); return {'status':'ok'}
+def parar(camera_id: str):
+    rt = runtime_camera(camera_id)
+    rt.parar_detector()
+    with rt.viewers_lock:
+        if rt.active_viewers == 0:
+            rt.fechar()
+    return {'status': 'ok'}
+
+@app.post('/cameras/{camera_id}/release')
+def liberar_camera(camera_id: str):
+    with runtimes_lock:
+        rt = runtimes.get(camera_id)
+        if rt:
+            rt.fechar()
+    return {'status': 'ok'}
 
 @app.put('/cameras/{camera_id}/modo')
 def modo(camera_id: str, modo_monitoramento: str):
@@ -194,18 +258,29 @@ def modo(camera_id: str, modo_monitoramento: str):
     return {'status':'ok', 'modo_monitoramento': modo_monitoramento}
 
 def gerar_mjpeg(camera_id):
-    rt = runtime_camera(camera_id); rt.iniciar_detector()
-    while True:
-        ok, buffer = cv2.imencode('.jpg', rt.renderizar())
-        yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
-        time.sleep(0.033)
+    rt = runtime_camera(camera_id)
+    rt.adicionar_visualizador()
+    try:
+        while True:
+            frame = rt.renderizar()
+            ok, buffer = cv2.imencode('.jpg', frame)
+            if ok:
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
+            time.sleep(0.04)
+    except (GeneratorExit, Exception):
+        pass
+    finally:
+        rt.remover_visualizador()
 
 @app.get('/video_feed/{camera_id}')
 def video_feed(camera_id: str): return StreamingResponse(gerar_mjpeg(camera_id), media_type='multipart/x-mixed-replace; boundary=frame')
 
 @app.post('/evento')
 def receber_evento(evento: EventoEmocao):
-    doc = evento.dict(); colecao_eventos.insert_one(doc); return {'status':'ok', 'evento_recebido': doc}
+    doc = evento.dict()
+    res = colecao_eventos.insert_one(doc)
+    doc['_id'] = str(res.inserted_id)
+    return {'status':'ok', 'evento_recebido': doc}
 
 @app.get('/eventos')
 def listar_eventos(limit: int = 10, camera_id: str | None = None, usuario_id: str | None = None):
