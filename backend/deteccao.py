@@ -89,16 +89,16 @@ class EmotionDetector:
                 self.rostos_detectados.append((centro_atual, agora))
 
     def salvar_frame_raiva_extrema(self, frame, score=0.9):
-        agora = time.time()
-        if agora - self.ultimo_registro_raiva_extrema < COOLDOWN_RAIVA_EXTREMA:
-            return
-        self.ultimo_registro_raiva_extrema = agora
         if registrar_alerta_raiva:
             try:
                 registrar_alerta_raiva(self.camera_id, self.camera_nome, score, frame)
             except Exception as e:
                 print(f"[ALERTA] Erro ao registrar alerta: {e}")
         else:
+            agora = time.time()
+            if agora - self.ultimo_registro_raiva_extrema < COOLDOWN_RAIVA_EXTREMA:
+                return
+            self.ultimo_registro_raiva_extrema = agora
             os.makedirs('imagens_alerta', exist_ok=True)
             filename = f"imagens_alerta/alerta_raiva_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
             cv2.imwrite(filename, frame)
@@ -115,7 +115,7 @@ class EmotionDetector:
         emotions = result['emotions']
         top = max(emotions, key=emotions.get)
         score = emotions[top]
-        if top == 'angry' and score > 0.8:
+        if top == 'angry' and score >= 0.60:
             self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
@@ -146,7 +146,7 @@ class EmotionDetector:
         medias = {emo: val / faces for emo, val in soma.items()}
         top = max(medias, key=medias.get)
         score = medias[top]
-        if top == 'angry' and score > 0.8:
+        if top == 'angry' and score >= 0.60:
             self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),

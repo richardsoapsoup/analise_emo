@@ -19,8 +19,8 @@ alerta_lock = threading.Lock()
 DEFAULT_CONFIG = {
     'email_destino': '',
     'ativo': True,
-    'limiar_raiva': 0.85,
-    'cooldown_segundos': 60,
+    'limiar_raiva': 0.75,
+    'cooldown_segundos': 30,
     'enviar_email': False,
     'smtp_host': 'smtp.gmail.com',
     'smtp_port': 587,
