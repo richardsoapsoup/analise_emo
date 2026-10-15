@@ -1,234 +1,247 @@
-
-from fastapi import FastAPI, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
-import threading
-import time
-import cv2
+import threading, time, cv2, numpy as np
+from bson import ObjectId
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+try:
+    from backend.models import EventoEmocao, UsuarioCreate, UsuarioUpdate, CameraCreate, CameraUpdate
+    from backend.database import colecao_eventos, colecao_usuarios, colecao_cameras
+except ImportError:
+    from models import EventoEmocao, UsuarioCreate, UsuarioUpdate, CameraCreate, CameraUpdate
+    from database import colecao_eventos, colecao_usuarios, colecao_cameras
 
-import numpy as np
+try:
+    from deteccao import EmotionDetector
+except ImportError:
+    from backend.deteccao import EmotionDetector
 
+app = FastAPI(title='API de Monitoramento Emocional')
+app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173','http://127.0.0.1:5173'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+API_EVENT_URL = 'http://127.0.0.1:8000/evento'
 
-from deteccao import EmotionDetector  
+def oid(id):
+    try: return ObjectId(id)
+    except Exception: raise HTTPException(status_code=400, detail='ID inválido')
 
+def serializar(doc):
+    doc['_id'] = str(doc['_id'])
+    return doc
 
+def normalizar_origem(origem):
+    return int(origem) if isinstance(origem, str) and origem.isdigit() else origem
 
+class CameraRuntime:
+    def __init__(self, doc):
+        self.camera_id = str(doc['_id'])
+        self.nome = doc['nome']
+        self.origem = doc['origem']
+        self.modo_monitoramento = doc.get('modo_monitoramento', 'individual')
+        self.cap = None
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.stop_capture = threading.Event()
+        self.capture_thread = None
+        self.detector = None
+        self.detector_lock = threading.Lock()
+        self.last_detections = []
 
-from backend.models import EventoEmocao
-from backend.database import colecao_eventos 
+    def abrir(self):
+        if self.cap and self.cap.isOpened(): return
+        self.cap = cv2.VideoCapture(normalizar_origem(self.origem))
 
-app = FastAPI(title="API de Monitoramento Emocional")
+    def iniciar_captura(self):
+        if self.capture_thread and self.capture_thread.is_alive(): return
+        self.abrir()
+        self.stop_capture.clear()
+        self.capture_thread = threading.Thread(target=self.loop_captura, daemon=True)
+        self.capture_thread.start()
 
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    def loop_captura(self):
+        while not self.stop_capture.is_set():
+            if not self.cap or not self.cap.isOpened():
+                time.sleep(0.5); self.abrir(); continue
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.2); continue
+            with self.frame_lock:
+                self.latest_frame = frame.copy()
+            time.sleep(0.01)
 
+    def get_frame(self):
+        with self.frame_lock:
+            return None if self.latest_frame is None else self.latest_frame.copy()
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("[ERROR] Não foi possível abrir a câmera (device 0).")
-    
+    def set_detections(self, detections):
+        self.last_detections = detections
 
+    def iniciar_detector(self):
+        with self.detector_lock:
+            if self.detector and self.detector.is_running(): return
+            self.iniciar_captura()
+            self.detector = EmotionDetector(self.get_frame, API_EVENT_URL, update_detections_cb=self.set_detections, camera_id=self.camera_id, camera_nome=self.nome, modo_monitoramento=self.modo_monitoramento)
+            self.detector.start()
 
-latest_frame = None
-frame_lock = threading.Lock()
-capture_thread = None
-capture_thread_stop = threading.Event()
-last_detections = [] 
+    def parar_detector(self):
+        with self.detector_lock:
+            if self.detector and self.detector.is_running(): self.detector.stop()
+            self.detector = None
 
-def capture_loop():
-    
-    global latest_frame
-    while not capture_thread_stop.is_set():
-        success, frame = cap.read()
-        if not success:
-           
-            time.sleep(0.2)
-            continue
-        with frame_lock:
-            latest_frame = frame.copy()
-       
-        time.sleep(0.01)
+    def alterar_modo(self, modo):
+        self.modo_monitoramento = modo
+        if self.detector: self.detector.set_modo_monitoramento(modo)
 
-def start_capture_thread():
-    global capture_thread
-    if capture_thread is None or not capture_thread.is_alive():
-        capture_thread_stop.clear()
-        capture_thread = threading.Thread(target=capture_loop, daemon=True)
-        capture_thread.start()
-        print("[CAPTURE] Capture thread iniciada.")
+    def fechar(self):
+        self.parar_detector()
+        self.stop_capture.set()
+        if self.capture_thread: self.capture_thread.join(timeout=2)
+        if self.cap and self.cap.isOpened(): self.cap.release()
 
-def stop_capture_thread():
-    global capture_thread
-    capture_thread_stop.set()
-    if capture_thread:
-        capture_thread.join(timeout=2)
-    print("[CAPTURE] Capture thread parada.")
-
-
-start_capture_thread()
-
-
-detector = None  
-detector_lock = threading.Lock()
-
-
-API_EVENT_URL = "http://127.0.0.1:8000/evento"
-
-
-def set_last_detections(detections):
-   
-    global last_detections
-    last_detections = detections
-
-
-@app.post("/start_detector")
-def start_detector():
-    global detector
-    with detector_lock:
-        if detector and detector.is_running():
-            return JSONResponse({"status": "aviso", "mensagem": "Detector já rodando."})
-        
-        def get_frame():
-            with frame_lock:
-                if latest_frame is None:
-                    return None
-                return latest_frame.copy()
-        
-        
-        detector = EmotionDetector(
-            get_frame=get_frame, 
-            api_url=API_EVENT_URL, 
-            update_detections_cb=set_last_detections
-        )
-        detector.start()
-        return {"status": "ok", "mensagem": "Detector iniciado."}
-
-@app.post("/stop_detector")
-def stop_detector():
-    global detector
-    with detector_lock:
-        if not detector or not detector.is_running():
-            return JSONResponse({"status": "aviso", "mensagem": "Nenhum detector em execução."})
-        detector.stop()
-        detector = None
-        return {"status": "ok", "mensagem": "Detector parado."}
-
-
-@app.post("/evento")
-def receber_evento(evento: EventoEmocao):
-    colecao_eventos.insert_one(evento.dict())
-    return {"status": "ok", "evento_recebido": evento.dict()}
-
-@app.get("/eventos")
-def listar_eventos(limit: int = 10):
-    eventos = list(colecao_eventos.find().sort("timestamp", -1).limit(limit))
-    for e in eventos:
-        e["_id"] = str(e["_id"])
-    return eventos
-
-
-def mjpeg_generator():
-    
-
-    global last_detections
-    while True:
-        with frame_lock:
-            frame = None if latest_frame is None else latest_frame.copy()
+    def renderizar(self):
+        frame = self.get_frame()
         if frame is None:
-            
-            blank = 255 * np.ones((480, 640, 3), dtype=np.uint8)
-            ret, buffer = cv2.imencode('.jpg', blank)
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.1)
-            continue
+            frame = 255 * np.ones((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame, f'Sem sinal: {self.nome}', (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+            return frame
+        for det in self.last_detections:
+            x, y, w, h = det['box']
+            emo = max(det['emotions'], key=det['emotions'].get)
+            color = (255,255,0)
+            if emo == 'angry': color = (0,0,255)
+            elif emo == 'sad': color = (255,0,0)
+            elif emo == 'happy': color = (0,255,0)
+            cv2.rectangle(frame, (x,y), (x+w,y+h), color, 2)
+            cv2.putText(frame, emo, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(frame, self.nome, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+        return frame
 
-       
-        if last_detections:
-            for det in last_detections:
-                (x, y, w, h) = det["box"]
-                emotion = max(det["emotions"], key=det["emotions"].get)
-                color = (0, 255, 0)
-                if emotion == "angry":
-                    color = (0, 0, 255)
-                elif emotion == "sad":
-                    color = (255, 0, 0)
-                elif emotion == "happy":
-                    color = (0, 255, 0)
-                else:
-                    color = (255, 255, 0)
+runtimes = {}
+runtimes_lock = threading.Lock()
 
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(frame, emotion, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+def runtime_camera(camera_id):
+    with runtimes_lock:
+        doc = colecao_cameras.find_one({'_id': oid(camera_id)})
+        if not doc: raise HTTPException(status_code=404, detail='Câmera não encontrada')
+        if camera_id not in runtimes: runtimes[camera_id] = CameraRuntime(doc)
+        return runtimes[camera_id]
 
-        
-        cv2.putText(frame, datetime.now().strftime("%H:%M:%S"),
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+@app.get('/')
+def home(): return {'status':'ok'}
 
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-       
+@app.post('/usuarios')
+def criar_usuario(usuario: UsuarioCreate):
+    doc = usuario.dict(); doc['created_at'] = datetime.utcnow(); doc['updated_at'] = datetime.utcnow()
+    res = colecao_usuarios.insert_one(doc); doc['_id'] = str(res.inserted_id); return doc
+
+@app.get('/usuarios')
+def listar_usuarios(ativos: bool | None = None):
+    filtro = {} if ativos is None else {'ativo': ativos}
+    return [serializar(u) for u in colecao_usuarios.find(filtro).sort('nome', 1)]
+
+@app.put('/usuarios/{usuario_id}')
+def atualizar_usuario(usuario_id: str, usuario: UsuarioUpdate):
+    dados = {k:v for k,v in usuario.dict().items() if v is not None}
+    dados['updated_at'] = datetime.utcnow()
+    r = colecao_usuarios.update_one({'_id': oid(usuario_id)}, {'$set': dados})
+    if not r.matched_count: raise HTTPException(status_code=404, detail='Usuário não encontrado')
+    return serializar(colecao_usuarios.find_one({'_id': oid(usuario_id)}))
+
+@app.delete('/usuarios/{usuario_id}')
+def remover_usuario(usuario_id: str):
+    r = colecao_usuarios.update_one({'_id': oid(usuario_id)}, {'$set': {'ativo': False, 'updated_at': datetime.utcnow()}})
+    if not r.matched_count: raise HTTPException(status_code=404, detail='Usuário não encontrado')
+    return {'status':'ok'}
+
+@app.post('/cameras')
+def criar_camera(camera: CameraCreate):
+    doc = camera.dict(); doc['created_at'] = datetime.utcnow(); doc['updated_at'] = datetime.utcnow()
+    res = colecao_cameras.insert_one(doc); doc['_id'] = str(res.inserted_id); return doc
+
+@app.get('/cameras')
+def listar_cameras(): return [serializar(c) for c in colecao_cameras.find().sort('created_at', 1)]
+
+@app.put('/cameras/{camera_id}')
+def atualizar_camera(camera_id: str, camera: CameraUpdate):
+    dados = {k:v for k,v in camera.dict().items() if v is not None}
+    dados['updated_at'] = datetime.utcnow()
+    r = colecao_cameras.update_one({'_id': oid(camera_id)}, {'$set': dados})
+    if not r.matched_count: raise HTTPException(status_code=404, detail='Câmera não encontrada')
+    with runtimes_lock:
+        rt = runtimes.pop(camera_id, None)
+        if rt: rt.fechar()
+    return serializar(colecao_cameras.find_one({'_id': oid(camera_id)}))
+
+@app.delete('/cameras/{camera_id}')
+def remover_camera(camera_id: str):
+    r = colecao_cameras.delete_one({'_id': oid(camera_id)})
+    if not r.deleted_count: raise HTTPException(status_code=404, detail='Câmera não encontrada')
+    with runtimes_lock:
+        rt = runtimes.pop(camera_id, None)
+        if rt: rt.fechar()
+    return {'status':'ok'}
+
+@app.post('/cameras/{camera_id}/start')
+def iniciar(camera_id: str): runtime_camera(camera_id).iniciar_detector(); return {'status':'ok'}
+
+@app.post('/cameras/{camera_id}/stop')
+def parar(camera_id: str): runtime_camera(camera_id).parar_detector(); return {'status':'ok'}
+
+@app.put('/cameras/{camera_id}/modo')
+def modo(camera_id: str, modo_monitoramento: str):
+    if modo_monitoramento not in ['individual','sala']: raise HTTPException(status_code=400, detail='Modo inválido')
+    colecao_cameras.update_one({'_id': oid(camera_id)}, {'$set': {'modo_monitoramento': modo_monitoramento, 'updated_at': datetime.utcnow()}})
+    runtime_camera(camera_id).alterar_modo(modo_monitoramento)
+    return {'status':'ok', 'modo_monitoramento': modo_monitoramento}
+
+def gerar_mjpeg(camera_id):
+    rt = runtime_camera(camera_id); rt.iniciar_detector()
+    while True:
+        ok, buffer = cv2.imencode('.jpg', rt.renderizar())
+        yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
         time.sleep(0.033)
 
-@app.get("/video_feed")
-def video_feed():
-    global detector
-    
-    with detector_lock:
-        if not (detector and detector.is_running()):
-            
-            try:
-                
-                def get_frame():
-                    with frame_lock:
-                        if latest_frame is None:
-                            return None
-                        return latest_frame.copy()
-                
-                
-                detector = EmotionDetector(
-                    get_frame=get_frame, 
-                    api_url=API_EVENT_URL,
-                    update_detections_cb=set_last_detections
-                )
-                detector.start()
-                print("[VIDEO_FEED] Detector iniciado automaticamente.")
-            except Exception as e:
-                print("[VIDEO_FEED] Falha ao iniciar detector automaticamente:", e)
+@app.get('/video_feed/{camera_id}')
+def video_feed(camera_id: str): return StreamingResponse(gerar_mjpeg(camera_id), media_type='multipart/x-mixed-replace; boundary=frame')
 
-    return StreamingResponse(mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+@app.post('/evento')
+def receber_evento(evento: EventoEmocao):
+    doc = evento.dict(); colecao_eventos.insert_one(doc); return {'status':'ok', 'evento_recebido': doc}
 
+@app.get('/eventos')
+def listar_eventos(limit: int = 10, camera_id: str | None = None, usuario_id: str | None = None):
+    filtro = {}
+    if camera_id: filtro['camera_id'] = camera_id
+    if usuario_id: filtro['usuario_id'] = usuario_id
+    return [serializar(e) for e in colecao_eventos.find(filtro).sort('timestamp', -1).limit(limit)]
 
-@app.on_event("shutdown")
-def shutdown_event():
-    print("[SHUTDOWN] Encerrando servidor...")
-    
-    with detector_lock:
-        if detector and detector.is_running():
-            detector.stop()
-    
-    try:
-        stop_capture_thread()
-    except Exception:
-        pass
-    
-    try:
-        if cap.isOpened():
-            cap.release()
-    except Exception:
-        pass
-    print("[SHUTDOWN] Recursos liberados.")
+@app.get('/relatorios/resumo')
+def resumo():
+    return {
+        'total_eventos': colecao_eventos.count_documents({}),
+        'total_alertas': colecao_eventos.count_documents({'comportamento': {'$in': ['potencialmente agressivo','agressivo']}}),
+        'total_cameras': colecao_cameras.count_documents({}),
+        'total_usuarios': colecao_usuarios.count_documents({'ativo': True}),
+        'por_emocao': [{'name': i['_id'] or 'Indefinido', 'value': i['total']} for i in colecao_eventos.aggregate([{'$group': {'_id':'$expressao_dominante','total':{'$sum':1}}}])],
+        'por_comportamento': [{'name': i['_id'] or 'Indefinido', 'value': i['total']} for i in colecao_eventos.aggregate([{'$group': {'_id':'$comportamento','total':{'$sum':1}}}])],
+        'por_camera': [{'name': i['_id'] or 'Sem nome', 'value': i['total']} for i in colecao_eventos.aggregate([{'$group': {'_id':'$camera_nome','total':{'$sum':1}}}])],
+    }
+
+@app.get('/relatorios/usuarios')
+def relatorio_usuarios():
+    usuarios = list(colecao_usuarios.find({'ativo': True}).sort('nome', 1))
+    resposta = []
+    for u in usuarios:
+        uid = str(u['_id'])
+        eventos = list(colecao_eventos.find({'usuario_id': uid}).sort('timestamp', -1).limit(200))
+        total = len(eventos)
+        alertas = sum(1 for e in eventos if e.get('comportamento') in ['potencialmente agressivo','agressivo'])
+        positivos = sum(1 for e in eventos if e.get('comportamento') == 'positivo')
+        media = round(sum(float(e.get('pontuacao', 0)) for e in eventos) / total, 2) if total else 0
+        resposta.append({'_id': uid, 'nome': u.get('nome'), 'email': u.get('email'), 'departamento': u.get('departamento'), 'total_eventos': total, 'alertas': alertas, 'positivos': positivos, 'pontuacao_media': media, 'ultimo_evento': eventos[0]['timestamp'] if eventos else None, 'status': 'warning' if alertas >= 3 else 'normal'})
+    return resposta
+
+@app.on_event('shutdown')
+def shutdown():
+    with runtimes_lock:
+        for rt in runtimes.values(): rt.fechar()
+        runtimes.clear()
