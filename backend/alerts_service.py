@@ -1,9 +1,17 @@
-import os, time, smtplib, cv2
+import os, sys, time, smtplib, cv2
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 import threading
+
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 try:
     from backend.database import colecao_alertas, colecao_config_alertas
@@ -35,7 +43,7 @@ def obter_config_alertas():
     config = colecao_config_alertas.find_one({'tipo': 'config_geral'})
     if not config:
         cfg = DEFAULT_CONFIG.copy()
-        cfg['tipo'] = 'config_geral'
+        cfg['tipo': 'config_geral']
         colecao_config_alertas.insert_one(cfg)
         config = cfg
     config['_id'] = str(config['_id'])
@@ -156,8 +164,7 @@ def enviar_email_alerta(alerta: dict, config: dict, image_path: str = None) -> d
 
     # Se não houver credenciais SMTP completas, loga e simula com sucesso
     if not smtp_host or not smtp_user or not smtp_pass:
-        print(f"[ALERTA EMAIL] Modo Simulação: E-mail para '{email_destino}' gerado com sucesso!")
-        print(f"               Assunto: {assunto}")
+        print(f"[ALERTA EMAIL] Modo Simulacao: E-mail para '{email_destino}' gerado com sucesso!")
         return {
             'status': 'simulado',
             'mensagem': f"Alerta registrado e e-mail simulado para {email_destino} (Credenciais SMTP não preenchidas)."
@@ -239,5 +246,5 @@ def registrar_alerta_raiva(camera_id: str, camera_nome: str, score: float, frame
             )
         threading.Thread(target=_enviar, daemon=True).start()
 
-    print(f"[ALERTA CRÍTICO] Raiva Extrema detectada na câmera '{camera_nome}'! Nível: {doc['pontuacao_percentual']}%")
+    print(f"[ALERTA CRITICO] Raiva Extrema detectada na camera '{camera_nome}'! Nivel: {doc['pontuacao_percentual']}%")
     return doc

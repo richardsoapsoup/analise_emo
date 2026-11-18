@@ -1,10 +1,31 @@
+# Pastas extras do projeto / TCC / Backups
+backup_versao_funcional/
+tcc_diretrizes_modelos/
+*.docx
+*.doc
+*.pdf
+*.pptx
+~$*
+
+# Ambiente virtual e variáveis de ambiente
 venv/
 .venv/
 .env
+.env.*
+
+# Cache do Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+
+# Pastas e arquivos gerados em execução (logs e capturas)
 capturas/
 imagens_alerta/
 logs/
+log_analise.json
+
+# Editores e SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

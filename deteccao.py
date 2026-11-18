@@ -1,4 +1,5 @@
 import threading, time, uuid, math, requests, cv2, os
+import numpy as np
 from datetime import datetime
 from fer import FER
 
@@ -10,10 +11,70 @@ except ImportError:
     except ImportError:
         registrar_alerta_raiva = None
 
-MIN_FACE_SIZE = 80
+MIN_FACE_SIZE = 60
 DISTANCIA_MAX = 80
 TEMPO_MAX_INATIVO = 3
 COOLDOWN_RAIVA_EXTREMA = 10
+
+
+def preprocessar_iluminacao(frame):
+    """Compensa luz muito alta (estourada/contra-luz) ou baixa iluminação usando LAB + Gamma adaptativo + CLAHE."""
+    if frame is None:
+        return None
+    try:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        media_luz = float(np.mean(l))
+        if media_luz > 150:
+            gamma = 1.35
+            lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
+            l = cv2.LUT(l, lut)
+        elif media_luz < 85:
+            gamma = 0.70
+            lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
+            l = cv2.LUT(l, lut)
+
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l)
+
+        lab_eq = cv2.merge((l_eq, a, b))
+        return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+    except Exception:
+        return frame
+
+
+def calibrar_emocoes(emotions):
+    """Aumenta a sensibilidade para a expressão de raiva ('angry'), que o modelo FER
+    costuma subestimar (especialmente com óculos ou iluminação forte)."""
+    if not emotions:
+        return emotions
+    emo = dict(emotions)
+    raw_angry = float(emo.get('angry', 0.0))
+    raw_happy = float(emo.get('happy', 0.0))
+
+    if raw_angry >= 0.08 and raw_happy < 0.25:
+        ganho = min(0.96, 0.58 + (raw_angry - 0.08) * 1.45)
+        emo['angry'] = round(max(raw_angry, ganho), 2)
+        emo['neutral'] = round(float(emo.get('neutral', 0.0)) * 0.35, 2)
+        emo['sad'] = round(float(emo.get('sad', 0.0)) * 0.45, 2)
+    return emo
+
+
+def normalizar_resultados(results):
+    if not results:
+        return []
+    normalizados = []
+    for r in results:
+        box = r.get('box')
+        if box is not None:
+            r = dict(r)
+            r['box'] = [int(v) for v in box]
+            if 'emotions' in r:
+                r['emotions'] = calibrar_emocoes(r['emotions'])
+            normalizados.append(r)
+    return normalizados
+
 
 class EmotionDetector:
     def __init__(self, get_frame, api_url='http://127.0.0.1:8000/evento', mtcnn=True,
@@ -21,12 +82,14 @@ class EmotionDetector:
                  camera_nome='Câmera 1', modo_monitoramento='individual'):
         self.get_frame = get_frame
         self.api_url = api_url
+        self.mtcnn = mtcnn
         self.poll_interval = poll_interval
         self.update_detections_cb = update_detections_cb
         self.camera_id = camera_id
         self.camera_nome = camera_nome
         self.modo_monitoramento = modo_monitoramento
-        self.detector = FER(mtcnn=mtcnn)
+        self.detector = None
+        self.detector_fallback = None
         self.rostos_detectados = []
         self.eventos_negativos = []
         self.historico_humor = []
@@ -47,7 +110,7 @@ class EmotionDetector:
     def stop(self):
         self._stop_event.set()
         self._running = False
-        if self._thread and self._thread.is_alive():
+        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=1.5)
         self._thread = None
         print(f'[DETECTOR] Parado: {self.camera_nome}')
@@ -63,7 +126,7 @@ class EmotionDetector:
         return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
     def classificar_comportamento(self, emocao, score):
-        if emocao == 'angry' and score > 0.6:
+        if emocao == 'angry' and score > 0.5:
             return 'potencialmente agressivo'
         if emocao == 'sad' and score > 0.6:
             return 'depressivo'
@@ -120,7 +183,7 @@ class EmotionDetector:
         emotions = result['emotions']
         top = max(emotions, key=emotions.get)
         score = emotions[top]
-        if top == 'angry' and score >= 0.60:
+        if top == 'angry' and score >= 0.50:
             self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
@@ -151,7 +214,7 @@ class EmotionDetector:
         medias = {emo: val / faces for emo, val in soma.items()}
         top = max(medias, key=medias.get)
         score = medias[top]
-        if top == 'angry' and score >= 0.60:
+        if top == 'angry' and score >= 0.50:
             self.salvar_frame_raiva_extrema(frame, score)
         return {
             'id_evento': str(uuid.uuid4()),
@@ -168,14 +231,30 @@ class EmotionDetector:
             'pessoas_unicas_ate_agora': len(self.rostos_detectados),
         }
 
+    def detectar_com_compensacao(self, frame):
+        frame_eq = preprocessar_iluminacao(frame)
+        results = self.detector.detect_emotions(frame_eq)
+        if not results:
+            results = self.detector.detect_emotions(frame)
+        if not results and self.detector_fallback is not None:
+            results = self.detector_fallback.detect_emotions(frame_eq)
+        return normalizar_resultados(results)
+
     def _run(self):
+        if self.detector is None:
+            try:
+                self.detector = FER(mtcnn=self.mtcnn)
+                self.detector_fallback = FER(mtcnn=False)
+            except Exception as e:
+                print('[DETECTOR] Erro ao inicializar FER:', e)
+                return
         while not self._stop_event.is_set():
             frame = self.get_frame()
             if frame is None or self._stop_event.is_set():
                 time.sleep(0.1)
                 continue
             try:
-                results = self.detector.detect_emotions(frame)
+                results = self.detectar_com_compensacao(frame)
                 if self.update_detections_cb and not self._stop_event.is_set():
                     self.update_detections_cb(results)
             except Exception as e:

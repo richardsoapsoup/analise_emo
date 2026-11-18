@@ -58,14 +58,15 @@ class CameraRuntime:
         self.modo_monitoramento = doc.get('modo_monitoramento', 'individual')
         self.cap = None
         self.latest_frame = None
-        self.frame_lock = threading.Lock()
+        self.frame_lock = threading.RLock()
         self.stop_capture = threading.Event()
         self.capture_thread = None
         self.detector = None
-        self.detector_lock = threading.Lock()
+        self.detector_lock = threading.RLock()
         self.last_detections = []
+        self.last_detections_ts = 0.0
         self.active_viewers = 0
-        self.viewers_lock = threading.Lock()
+        self.viewers_lock = threading.RLock()
         self.release_timer = None
 
     def abrir(self):
@@ -86,34 +87,48 @@ class CameraRuntime:
     def iniciar_captura(self):
         self.stop_capture.clear()
         if self.capture_thread and self.capture_thread.is_alive():
-            if not self.cap or not self.cap.isOpened():
-                self.abrir()
             return
-        self.abrir()
         self.capture_thread = threading.Thread(target=self.loop_captura, daemon=True)
         self.capture_thread.start()
 
     def loop_captura(self):
-        while not self.stop_capture.is_set():
-            if not self.cap or not self.cap.isOpened():
-                time.sleep(0.3)
-                if not self.stop_capture.is_set():
-                    self.abrir()
-                continue
-            ok, frame = self.cap.read()
-            if not ok or frame is None:
-                time.sleep(0.05)
-                continue
+        try:
+            self.abrir()
+            while not self.stop_capture.is_set():
+                if not self.cap or not self.cap.isOpened():
+                    time.sleep(0.3)
+                    if not self.stop_capture.is_set():
+                        self.abrir()
+                    continue
+                ok, frame = self.cap.read()
+                if not ok or frame is None:
+                    time.sleep(0.05)
+                    continue
+                with self.frame_lock:
+                    self.latest_frame = frame.copy()
+                time.sleep(0.01)
+        finally:
+            if self.cap:
+                try:
+                    if self.cap.isOpened():
+                        self.cap.release()
+                except Exception as e:
+                    print(f"[CAMERA] Erro ao liberar cap: {e}")
+                self.cap = None
             with self.frame_lock:
-                self.latest_frame = frame.copy()
-            time.sleep(0.01)
+                self.latest_frame = None
 
     def get_frame(self):
         with self.frame_lock:
             return None if self.latest_frame is None else self.latest_frame.copy()
 
     def set_detections(self, detections):
-        self.last_detections = detections
+        agora = time.time()
+        if detections:
+            self.last_detections = detections
+            self.last_detections_ts = agora
+        elif agora - self.last_detections_ts > 1.2:
+            self.last_detections = []
 
     def iniciar_detector(self):
         with self.detector_lock:
@@ -144,17 +159,11 @@ class CameraRuntime:
             self.active_viewers = 0
         self.stop_capture.set()
         self.parar_detector()
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=1.0)
+        ct = self.capture_thread
+        if ct and ct.is_alive() and ct is not threading.current_thread():
+            ct.join(timeout=2.0)
         self.capture_thread = None
         with self.frame_lock:
-            if self.cap:
-                try:
-                    if self.cap.isOpened():
-                        self.cap.release()
-                except Exception as e:
-                    print(f"[CAMERA] Erro ao liberar cap: {e}")
-                self.cap = None
             self.latest_frame = None
         print(f"[CAMERA] Câmera '{self.nome}' encerrada e hardware liberado com sucesso.")
 
@@ -165,7 +174,7 @@ class CameraRuntime:
                 self.release_timer = None
             self.active_viewers += 1
             print(f"[CAMERA] Visualizador conectado ({self.nome}). Total de visualizadores ativos: {self.active_viewers}")
-            self.iniciar_detector()
+        self.iniciar_detector()
 
     def remover_visualizador(self):
         with self.viewers_lock:
@@ -182,26 +191,30 @@ class CameraRuntime:
         self.release_timer.start()
 
     def _desligar_se_sem_visualizadores(self):
+        should_close = False
         with self.viewers_lock:
             if self.active_viewers == 0:
-                print(f"[CAMERA] Nenhum visualizador ativo há 2 segundos. Desligando hardware da câmera '{self.nome}'...")
-                self.fechar()
+                should_close = True
+        if should_close:
+            print(f"[CAMERA] Nenhum visualizador ativo há 2 segundos. Desligando hardware da câmera '{self.nome}'...")
+            self.fechar()
 
     def renderizar(self):
         frame = self.get_frame()
         if frame is None:
-            frame = 255 * np.ones((480, 640, 3), dtype=np.uint8)
-            cv2.putText(frame, f'Sem sinal: {self.nome}', (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+            frame = 30 * np.ones((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame, f'Iniciando camera: {self.nome}...', (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
             return frame
         for det in self.last_detections:
-            x, y, w, h = det['box']
+            x, y, w, h = [int(v) for v in det['box']]
             emo = max(det['emotions'], key=det['emotions'].get)
+            score_pct = int(round(det['emotions'][emo] * 100))
             color = (255,255,0)
             if emo == 'angry': color = (0,0,255)
             elif emo == 'sad': color = (255,0,0)
             elif emo == 'happy': color = (0,255,0)
             cv2.rectangle(frame, (x,y), (x+w,y+h), color, 2)
-            cv2.putText(frame, emo, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(frame, f"{emo} ({score_pct}%)", (x, max(25, y-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
         cv2.putText(frame, self.nome, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
         return frame
 
@@ -258,15 +271,15 @@ def atualizar_camera(camera_id: str, camera: CameraUpdate):
     if not r.matched_count: raise HTTPException(status_code=404, detail='Câmera não encontrada')
     with runtimes_lock:
         rt = runtimes.pop(camera_id, None)
-        if rt: rt.fechar()
+    if rt: rt.fechar()
     return serializar(colecao_cameras.find_one({'_id': oid(camera_id)}))
 
 @app.delete('/cameras/{camera_id}')
 def remover_camera(camera_id: str):
     with runtimes_lock:
         rt = runtimes.pop(camera_id, None)
-        if rt:
-            rt.fechar()
+    if rt:
+        rt.fechar()
     try:
         colecao_cameras.delete_one({'_id': oid(camera_id)})
     except Exception as e:
@@ -283,17 +296,17 @@ def iniciar(camera_id: str):
 def parar(camera_id: str):
     with runtimes_lock:
         rt = runtimes.get(camera_id)
-        if rt:
-            rt.parar_detector()
-            rt.fechar()
+    if rt:
+        rt.parar_detector()
+        rt.fechar()
     return {'status': 'ok'}
 
 @app.post('/cameras/{camera_id}/release')
 def liberar_camera(camera_id: str):
     with runtimes_lock:
         rt = runtimes.get(camera_id)
-        if rt:
-            rt.fechar()
+    if rt:
+        rt.fechar()
     return {'status': 'ok'}
 
 @app.put('/cameras/{camera_id}/modo')
@@ -443,5 +456,7 @@ def testar_alerta_manual():
 @app.on_event('shutdown')
 def shutdown():
     with runtimes_lock:
-        for rt in runtimes.values(): rt.fechar()
+        rts = list(runtimes.values())
         runtimes.clear()
+    for rt in rts:
+        rt.fechar()
